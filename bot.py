@@ -2,91 +2,170 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import os
+import sqlite3
+from datetime import datetime
 
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
+
+BRAND_NAME = "Skyline Tickets"
+LOG_CHANNEL_NAME = "ticket-logs"
+
+TICKET_CONFIG = {
+    "join-us": {
+        "title": "🤝 JOIN US",
+        "role": "Human Resource",
+        "color": 0x00FF99,
+        "description": "Open a recruitment ticket and speak with our Human Resource team."
+    },
+    "partnership": {
+        "title": "🧞 PARTNERSHIP REQUEST",
+        "role": "Partnership Manager",
+        "color": 0xAA00FF,
+        "description": "Open a partnership ticket and speak with our Partnership Manager."
+    },
+    "book-us": {
+        "title": "🚛 BOOK US",
+        "role": "SSV Staff",
+        "color": 0xFF9900,
+        "description": "Open a booking ticket and speak with SSV Staff."
+    },
+    "support": {
+        "title": "🚀 SUPPORT CENTER",
+        "role": "Support Staff",
+        "color": 0x00BFFF,
+        "description": "Open a support ticket and speak with Support Staff."
+    }
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+db = sqlite3.connect("tickets.db")
+cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    ticket_type TEXT,
+    channel_name TEXT,
+    created_at TEXT,
+    closed_at TEXT,
+    status TEXT
+)
+""")
+db.commit()
+
+
+async def send_log(guild, embed):
+    log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_channel:
+        await log_channel.send(embed=embed)
+
 
 class TicketButton(discord.ui.View):
-
     def __init__(self, ticket_type):
         super().__init__(timeout=None)
         self.ticket_type = ticket_type
 
-    @discord.ui.button(
-        label="Open Ticket",
-        style=discord.ButtonStyle.blurple,
-        emoji="📩"
-    )
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.blurple, emoji="📩")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-
         guild = interaction.guild
         user = interaction.user
+        config = TICKET_CONFIG[self.ticket_type]
+
+        staff_role = discord.utils.get(guild.roles, name=config["role"])
+
+        if staff_role is None:
+            await interaction.response.send_message(
+                f"❌ Staff role `{config['role']}` not found.",
+                ephemeral=True
+            )
+            return
 
         category = discord.utils.get(guild.categories, name="TICKETS")
-
         if category is None:
             category = await guild.create_category("TICKETS")
 
-        channel_name = f"{self.ticket_type}-{user.name}".lower()
+        channel_name = f"{self.ticket_type}-{user.name}".lower().replace(" ", "-")
 
         existing = discord.utils.get(guild.text_channels, name=channel_name)
-
         if existing:
             await interaction.response.send_message(
-                f"You already have a ticket: {existing.mention}",
+                f"❌ You already have a ticket: {existing.mention}",
                 ephemeral=True
             )
             return
 
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=False
-            ),
-
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
             user: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 read_message_history=True
             ),
-
+            staff_role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True
+            ),
             guild.me: discord.PermissionOverwrite(
                 view_channel=True,
-                send_messages=True
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True
             )
         }
 
         ticket_channel = await guild.create_text_channel(
-            channel_name,
+            name=channel_name,
             category=category,
             overwrites=overwrites
         )
+
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            "INSERT INTO tickets (user_id, username, ticket_type, channel_name, created_at, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (user.id, str(user), self.ticket_type, ticket_channel.name, created_at, "open")
+        )
+        db.commit()
 
         embed = discord.Embed(
             title="🎫 Ticket Created",
             description=(
                 f"Welcome {user.mention}!\n\n"
-                f"📂 Ticket Type: `{self.ticket_type}`\n"
-                f"⚡ Support team will assist you shortly."
+                f"📂 **Ticket Type:** `{config['title']}`\n"
+                f"👮 **Staff Team:** {staff_role.mention}\n\n"
+                f"Please explain your request clearly."
             ),
-            color=0x00BFFF
+            color=config["color"]
         )
 
         embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+        embed.set_footer(text=f"{BRAND_NAME} • Premium Ticket System")
 
-        embed.set_footer(
-            text="Skyline Tickets • Premium Support",
-            icon_url=guild.icon.url if guild.icon else None
-        )
-
-        await ticket_channel.send(embed=embed)
+        await ticket_channel.send(content=f"{staff_role.mention} New ticket opened by {user.mention}", embed=embed)
         await ticket_channel.send("🔒 Use `!close` to close this ticket.")
+
+        log_embed = discord.Embed(
+            title="📥 Ticket Opened",
+            color=0x00FF99
+        )
+        log_embed.add_field(name="User", value=user.mention, inline=True)
+        log_embed.add_field(name="Type", value=config["title"], inline=True)
+        log_embed.add_field(name="Channel", value=ticket_channel.mention, inline=False)
+        log_embed.add_field(name="Staff Role", value=staff_role.mention, inline=True)
+        log_embed.add_field(name="Created At", value=created_at, inline=True)
+        log_embed.set_footer(text=BRAND_NAME)
+
+        await send_log(guild, log_embed)
 
         await interaction.response.send_message(
             f"✅ Ticket created: {ticket_channel.mention}",
@@ -99,120 +178,77 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-@bot.command()
-async def joinus(ctx):
+async def send_ticket_panel(ctx, ticket_type):
+    config = TICKET_CONFIG[ticket_type]
 
     embed = discord.Embed(
-        title="🤝 JOIN US",
+        title=config["title"],
         description=(
             "━━━━━━━━━━━━━━━━━━\n"
-            "Interested in joining our team?\n\n"
-            "📩 Open a recruitment ticket\n"
-            "⚡ Speak directly with management\n"
-            "🚛 Become part of Skyline\n"
+            f"{config['description']}\n\n"
+            "🔒 Private ticket\n"
+            "⚡ Fast staff response\n"
+            "📩 Click below to open\n"
             "━━━━━━━━━━━━━━━━━━"
         ),
-        color=0x00FF99
+        color=config["color"]
     )
 
     embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
+    embed.set_footer(text=f"{BRAND_NAME} • {config['role']}")
 
-    embed.set_footer(
-        text="Skyline Tickets • Recruitment",
-        icon_url=ctx.guild.icon.url if ctx.guild.icon else None
-    )
+    await ctx.send(embed=embed, view=TicketButton(ticket_type))
 
-    await ctx.send(embed=embed, view=TicketButton("join-us"))
+
+@bot.command()
+async def joinus(ctx):
+    await send_ticket_panel(ctx, "join-us")
 
 
 @bot.command()
 async def partnership(ctx):
-
-    embed = discord.Embed(
-        title="🧞 PARTNERSHIP REQUEST",
-        description=(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "Interested in partnering with us?\n\n"
-            "🤝 Open a partnership ticket\n"
-            "🌐 Collaborate with Skyline\n"
-            "⚡ Quick management response\n"
-            "━━━━━━━━━━━━━━━━━━"
-        ),
-        color=0xAA00FF
-    )
-
-    embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
-
-    embed.set_footer(
-        text="Skyline Tickets • Partnership",
-        icon_url=ctx.guild.icon.url if ctx.guild.icon else None
-    )
-
-    await ctx.send(embed=embed, view=TicketButton("partnership"))
+    await send_ticket_panel(ctx, "partnership")
 
 
 @bot.command()
 async def bookus(ctx):
-
-    embed = discord.Embed(
-        title="🚛 BOOK US",
-        description=(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "Need Skyline for your convoy/event?\n\n"
-            "📅 Open a booking ticket\n"
-            "🚛 Professional convoy services\n"
-            "⚡ Fast scheduling support\n"
-            "━━━━━━━━━━━━━━━━━━"
-        ),
-        color=0xFF9900
-    )
-
-    embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
-
-    embed.set_footer(
-        text="Skyline Tickets • Booking",
-        icon_url=ctx.guild.icon.url if ctx.guild.icon else None
-    )
-
-    await ctx.send(embed=embed, view=TicketButton("book-us"))
+    await send_ticket_panel(ctx, "book-us")
 
 
 @bot.command()
 async def support(ctx):
-
-    embed = discord.Embed(
-        title="🚀 SUPPORT CENTER",
-        description=(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "Need assistance from our team?\n\n"
-            "🎫 Open a private support ticket\n"
-            "🔒 Secure assistance\n"
-            "⚡ Fast support response\n"
-            "━━━━━━━━━━━━━━━━━━"
-        ),
-        color=0x00BFFF
-    )
-
-    embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
-
-    embed.set_footer(
-        text="Skyline Tickets • Premium Support",
-        icon_url=ctx.guild.icon.url if ctx.guild.icon else None
-    )
-
-    await ctx.send(embed=embed, view=TicketButton("support"))
+    await send_ticket_panel(ctx, "support")
 
 
 @bot.command()
 async def close(ctx):
+    valid_prefixes = tuple(TICKET_CONFIG.keys())
 
-    if ctx.channel.name.startswith(("join-us", "partnership", "book-us", "support")):
-
-        await ctx.send("🔒 Closing ticket...")
-        await ctx.channel.delete()
-
-    else:
+    if not ctx.channel.name.startswith(valid_prefixes):
         await ctx.send("❌ This is not a ticket channel.")
+        return
+
+    closed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute(
+        "UPDATE tickets SET closed_at = ?, status = ? WHERE channel_name = ? AND status = ?",
+        (closed_at, "closed", ctx.channel.name, "open")
+    )
+    db.commit()
+
+    log_embed = discord.Embed(
+        title="📤 Ticket Closed",
+        color=0xFF0000
+    )
+    log_embed.add_field(name="Closed By", value=ctx.author.mention, inline=True)
+    log_embed.add_field(name="Channel", value=ctx.channel.name, inline=True)
+    log_embed.add_field(name="Closed At", value=closed_at, inline=False)
+    log_embed.set_footer(text=BRAND_NAME)
+
+    await send_log(ctx.guild, log_embed)
+
+    await ctx.send("🔒 Closing ticket...")
+    await ctx.channel.delete()
 
 
 bot.run(TOKEN)
