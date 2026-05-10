@@ -6,37 +6,16 @@ import sqlite3
 from datetime import datetime
 
 load_dotenv()
-
 TOKEN = os.getenv("TOKEN")
 
 BRAND_NAME = "Skyline Tickets"
 LOG_CHANNEL_NAME = "ticket-logs"
 
 TICKET_CONFIG = {
-    "join-us": {
-        "title": "🤝 JOIN US",
-        "role": "Human Resource",
-        "color": 0x00FF99,
-        "description": "Open a recruitment ticket and speak with our Human Resource team."
-    },
-    "partnership": {
-        "title": "🧞 PARTNERSHIP REQUEST",
-        "role": "Partnership Manager",
-        "color": 0xAA00FF,
-        "description": "Open a partnership ticket and speak with our Partnership Manager."
-    },
-    "book-us": {
-        "title": "🚛 BOOK US",
-        "role": "SSV Staff",
-        "color": 0xFF9900,
-        "description": "Open a booking ticket and speak with SSV Staff."
-    },
-    "support": {
-        "title": "🚀 SUPPORT CENTER",
-        "role": "Support Staff",
-        "color": 0x00BFFF,
-        "description": "Open a support ticket and speak with Support Staff."
-    }
+    "join-us": {"title": "🤝 JOIN US", "role": "Human Resource", "color": 0x00FF99},
+    "partnership": {"title": "🧞 PARTNERSHIP REQUEST", "role": "Partnership Manager", "color": 0xAA00FF},
+    "book-us": {"title": "🚛 BOOK US", "role": "SSV Staff", "color": 0xFF9900},
+    "support": {"title": "🚀 SUPPORT CENTER", "role": "Support Staff", "color": 0x00BFFF},
 }
 
 intents = discord.Intents.default()
@@ -56,9 +35,19 @@ CREATE TABLE IF NOT EXISTS tickets (
     channel_name TEXT,
     created_at TEXT,
     closed_at TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
     status TEXT
 )
 """)
+db.commit()
+
+for column in ["claimed_by", "claimed_at"]:
+    try:
+        cursor.execute(f"ALTER TABLE tickets ADD COLUMN {column} TEXT")
+    except sqlite3.OperationalError:
+        pass
+
 db.commit()
 
 
@@ -66,6 +55,70 @@ async def send_log(guild, embed):
     log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
     if log_channel:
         await log_channel.send(embed=embed)
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self, ticket_type):
+        super().__init__(timeout=None)
+        self.ticket_type = ticket_type
+
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.green, emoji="✅")
+    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
+        config = TICKET_CONFIG[self.ticket_type]
+
+        staff_role = discord.utils.get(guild.roles, name=config["role"])
+
+        if staff_role not in user.roles:
+            await interaction.response.send_message(
+                "❌ You are not allowed to claim this ticket.",
+                ephemeral=True
+            )
+            return
+
+        cursor.execute(
+            "SELECT claimed_by FROM tickets WHERE channel_name = ? AND status = ?",
+            (interaction.channel.name, "open")
+        )
+        result = cursor.fetchone()
+
+        if result and result[0]:
+            await interaction.response.send_message(
+                f"❌ This ticket is already claimed by `{result[0]}`.",
+                ephemeral=True
+            )
+            return
+
+        claimed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            "UPDATE tickets SET claimed_by = ?, claimed_at = ? WHERE channel_name = ? AND status = ?",
+            (str(user), claimed_at, interaction.channel.name, "open")
+        )
+        db.commit()
+
+        button.disabled = True
+        button.label = f"Claimed by {user.display_name}"
+
+        await interaction.response.edit_message(view=self)
+
+        claim_embed = discord.Embed(
+            title="✅ Ticket Claimed",
+            description=f"This ticket has been claimed by {user.mention}.",
+            color=0x00FF99
+        )
+        claim_embed.set_footer(text=BRAND_NAME)
+
+        await interaction.channel.send(embed=claim_embed)
+
+        log_embed = discord.Embed(title="✅ Ticket Claimed", color=0x00FF99)
+        log_embed.add_field(name="Claimed By", value=user.mention, inline=True)
+        log_embed.add_field(name="Channel", value=interaction.channel.mention, inline=True)
+        log_embed.add_field(name="Claimed At", value=claimed_at, inline=False)
+        log_embed.set_footer(text=BRAND_NAME)
+
+        await send_log(guild, log_embed)
 
 
 class TicketButton(discord.ui.View):
@@ -104,11 +157,7 @@ class TicketButton(discord.ui.View):
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            ),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             staff_role: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -132,7 +181,11 @@ class TicketButton(discord.ui.View):
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute(
-            "INSERT INTO tickets (user_id, username, ticket_type, channel_name, created_at, status) VALUES (?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO tickets 
+            (user_id, username, ticket_type, channel_name, created_at, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
             (user.id, str(user), self.ticket_type, ticket_channel.name, created_at, "open")
         )
         db.commit()
@@ -147,17 +200,20 @@ class TicketButton(discord.ui.View):
             ),
             color=config["color"]
         )
-
         embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
         embed.set_footer(text=f"{BRAND_NAME} • Premium Ticket System")
 
-        await ticket_channel.send(content=f"{staff_role.mention} New ticket opened by {user.mention}", embed=embed)
-        await ticket_channel.send("🔒 Use `!close` to close this ticket.")
-
-        log_embed = discord.Embed(
-            title="📥 Ticket Opened",
-            color=0x00FF99
+        await ticket_channel.send(
+            content=f"{staff_role.mention} New ticket opened by {user.mention}",
+            embed=embed
         )
+
+        await ticket_channel.send(
+            "✅ Staff can claim this ticket below.\n🔒 Use `!close` to close this ticket.",
+            view=TicketControlView(self.ticket_type)
+        )
+
+        log_embed = discord.Embed(title="📥 Ticket Opened", color=0x00FF99)
         log_embed.add_field(name="User", value=user.mention, inline=True)
         log_embed.add_field(name="Type", value=config["title"], inline=True)
         log_embed.add_field(name="Channel", value=ticket_channel.mention, inline=False)
@@ -185,7 +241,6 @@ async def send_ticket_panel(ctx, ticket_type):
         title=config["title"],
         description=(
             "━━━━━━━━━━━━━━━━━━\n"
-            f"{config['description']}\n\n"
             "🔒 Private ticket\n"
             "⚡ Fast staff response\n"
             "📩 Click below to open\n"
@@ -222,9 +277,7 @@ async def support(ctx):
 
 @bot.command()
 async def close(ctx):
-    valid_prefixes = tuple(TICKET_CONFIG.keys())
-
-    if not ctx.channel.name.startswith(valid_prefixes):
+    if not ctx.channel.name.startswith(tuple(TICKET_CONFIG.keys())):
         await ctx.send("❌ This is not a ticket channel.")
         return
 
@@ -236,10 +289,7 @@ async def close(ctx):
     )
     db.commit()
 
-    log_embed = discord.Embed(
-        title="📤 Ticket Closed",
-        color=0xFF0000
-    )
+    log_embed = discord.Embed(title="📤 Ticket Closed", color=0xFF0000)
     log_embed.add_field(name="Closed By", value=ctx.author.mention, inline=True)
     log_embed.add_field(name="Channel", value=ctx.channel.name, inline=True)
     log_embed.add_field(name="Closed At", value=closed_at, inline=False)
